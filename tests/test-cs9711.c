@@ -123,6 +123,63 @@ test_init_transitions (void)
   g_assert_cmpuint (hops, ==, 4); /* DRAIN, SEND_RESET, SETTLE, SEND_INIT */
 }
 
+/* The round-3 blocker: the init-timeout path advanced the machine and then let
+ * its (recovered) error reach the epilogue, which failed the machine while the
+ * follow-up bulk read was in flight. The rule is that a state which already
+ * advanced owns the next step, so the epilogue must never fail. */
+static void
+test_init_epilogue (void)
+{
+  Cs9711InitEpilogue e;
+  /* Clean sync state: advance. */
+  g_assert_cmpint (cs9711_init_epilogue (FALSE, FALSE, FALSE), ==,
+                   CS9711_INIT_EPILOGUE_ADVANCE);
+
+  /* Real error, nothing advanced: fail. */
+  g_assert_cmpint (cs9711_init_epilogue (TRUE, FALSE, FALSE), ==,
+                   CS9711_INIT_EPILOGUE_FAIL);
+
+  /* A read callback will drive the machine: stay, error or not. */
+  g_assert_cmpint (cs9711_init_epilogue (FALSE, TRUE, FALSE), ==,
+                   CS9711_INIT_EPILOGUE_STAY);
+  g_assert_cmpint (cs9711_init_epilogue (TRUE, TRUE, FALSE), ==,
+                   CS9711_INIT_EPILOGUE_STAY);
+
+  /* A case body already advanced: stay, and in particular never fail. This is
+   * the exact shape of the regression. The error case logs a warning by
+   * design (reaching it means a case body leaked a recovered error), so the
+   * expected warning is caught rather than escalated by the test harness. */
+  g_assert_cmpint (cs9711_init_epilogue (FALSE, FALSE, TRUE), ==,
+                   CS9711_INIT_EPILOGUE_STAY);
+
+  g_test_expect_message ("libfprint-cs9711", G_LOG_LEVEL_WARNING,
+                         "*error after the init SM advanced*");
+  e = cs9711_init_epilogue (TRUE, FALSE, TRUE);
+  g_test_assert_expected_messages ();
+  g_assert_cmpint (e, ==, CS9711_INIT_EPILOGUE_STAY);
+}
+
+static void
+test_init_recoverable_error (void)
+{
+  g_autoptr(GError) timeout_usb = NULL;
+  g_autoptr(GError) no_device = NULL;
+  g_autoptr(GError) other_domain = NULL;
+
+  timeout_usb = g_error_new_literal (G_USB_DEVICE_ERROR,
+                                     G_USB_DEVICE_ERROR_TIMED_OUT, "t");
+  no_device = g_error_new_literal (G_USB_DEVICE_ERROR,
+                                   G_USB_DEVICE_ERROR_NO_DEVICE, "gone");
+  other_domain = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED, "c");
+
+  /* Only a USB timeout on the init query is the recoverable case; it is the one
+   * the state machine clears before advancing. Any other error must fail. */
+  g_assert_true (cs9711_init_error_is_recoverable (timeout_usb));
+  g_assert_false (cs9711_init_error_is_recoverable (no_device));
+  g_assert_false (cs9711_init_error_is_recoverable (other_domain));
+  g_assert_false (cs9711_init_error_is_recoverable (NULL));
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -132,6 +189,8 @@ main (int argc, char *argv[])
   g_test_add_func ("/cs9711/init-mismatch-action", test_init_mismatch_action);
   g_test_add_func ("/cs9711/init-state-order", test_init_state_order);
   g_test_add_func ("/cs9711/init-transitions", test_init_transitions);
+  g_test_add_func ("/cs9711/init-epilogue", test_init_epilogue);
+  g_test_add_func ("/cs9711/init-recoverable-error", test_init_recoverable_error);
 
   return g_test_run ();
 }

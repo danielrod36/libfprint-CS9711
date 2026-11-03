@@ -83,6 +83,41 @@ cs9711_init_mismatch_action (guint resyncs, guint max_resyncs)
                                  CS9711_INIT_MISMATCH_FAIL;
 }
 
+gboolean
+cs9711_init_error_is_recoverable (const GError *error)
+{
+  /* A timeout on the first init query is expected: the reader answers late.
+   * RECOVER_READ_IGNORED picks the answer up, so the error must be cleared
+   * before advancing -- otherwise the epilogue fails a machine whose follow-up
+   * read is in flight. */
+  return error != NULL &&
+         error->domain == G_USB_DEVICE_ERROR &&
+         error->code == G_USB_DEVICE_ERROR_TIMED_OUT;
+}
+
+Cs9711InitEpilogue
+cs9711_init_epilogue (gboolean has_error, gboolean advanced_by_callback,
+                      gboolean advanced_in_case)
+{
+  /* A state that already advanced owns the machine's fate: failing it here
+   * would free the machine while the read that state just submitted is still
+   * in flight (round-3 blocker). */
+  if (advanced_by_callback || advanced_in_case)
+    {
+      /* An error alongside a callback-driven state is expected: the read that
+       * state submitted reports through its own callback. Only a case body that
+       * advanced AND left an error set is a bug, because the machine is then
+       * live while its follow-up read is in flight. */
+      if (has_error && advanced_in_case && !advanced_by_callback)
+        g_warning ("cs9711: error after the init SM advanced; ignoring it to "
+                   "avoid freeing a machine with a read in flight");
+
+      return CS9711_INIT_EPILOGUE_STAY;
+    }
+
+  return has_error ? CS9711_INIT_EPILOGUE_FAIL : CS9711_INIT_EPILOGUE_ADVANCE;
+}
+
 Cs9711InitState
 cs9711_init_next_state (Cs9711InitState state)
 {
@@ -324,8 +359,13 @@ m_init_state (FpiSsm *ssm, FpDevice *_dev)
       if (error)
         {
           fp_dbg("Error details: '%s', quark: %u code: %d", error->message, error->domain, error->code);
-          if (error->code == G_USB_DEVICE_ERROR_TIMED_OUT && error->domain == G_USB_DEVICE_ERROR)
+          if (cs9711_init_error_is_recoverable (error))
             {
+              /* Deliberate recovery: the timeout is expected and already
+               * handled by the state we advance into. Clear it, or the epilogue
+               * below would fail the machine after it has advanced -- freeing it
+               * while RECOVER_READ_IGNORED's bulk read is still in flight. */
+              g_clear_error (&error);
               fpi_ssm_next_state (ssm);
               advanced_in_case = TRUE;
             }
@@ -385,19 +425,30 @@ m_init_state (FpiSsm *ssm, FpDevice *_dev)
       g_assert_not_reached ();
     }
 
-  if (error)
-    {
-      fpi_ssm_mark_failed (ssm, error);
-      return;
-    }
-
   /* The single place this machine advances. Every synchronous state falls
    * through to here, so a case body cannot step the SSM itself: the former
    * blocker was exactly that, a second advance out of RESYNC_SEND_INIT that
    * ran past RECEIVE_STATUS and completed the machine while its bulk read was
-   * still in flight. */
-  if (!advanced_by_callback && !advanced_in_case)
-    fpi_ssm_jump_to_state (ssm, cs9711_init_next_state (state));
+   * still in flight.
+   *
+   * Failing after a state already advanced is the same class of bug: the
+   * machine is freed while the follow-up read is in flight. cs9711_init_epilogue()
+   * encodes the rule once, and the init-timeout path clears its recovered error
+   * before advancing so this cannot trigger there. */
+  switch (cs9711_init_epilogue (error != NULL, advanced_by_callback,
+                                advanced_in_case))
+    {
+    case CS9711_INIT_EPILOGUE_FAIL:
+      fpi_ssm_mark_failed (ssm, error);
+      break;
+
+    case CS9711_INIT_EPILOGUE_ADVANCE:
+      fpi_ssm_jump_to_state (ssm, cs9711_init_next_state (state));
+      break;
+
+    case CS9711_INIT_EPILOGUE_STAY:
+      break;
+    }
 }
 
 /* Complete init sequential state machine */

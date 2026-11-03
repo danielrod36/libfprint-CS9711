@@ -79,6 +79,19 @@ Cs9711InitMismatchAction cs9711_init_mismatch_action (guint         resyncs,
  * (it defers to an async read callback). */
 Cs9711InitState          cs9711_init_next_state     (Cs9711InitState state);
 
+gboolean                 cs9711_init_error_is_recoverable (const GError *error);
+
+typedef enum
+{
+  CS9711_INIT_EPILOGUE_ADVANCE, /* advance exactly one state */
+  CS9711_INIT_EPILOGUE_FAIL,    /* fail the machine with the error */
+  CS9711_INIT_EPILOGUE_STAY,    /* a state or callback owns the next step */
+} Cs9711InitEpilogue;
+
+Cs9711InitEpilogue       cs9711_init_epilogue       (gboolean has_error,
+                                                      gboolean advanced_by_callback,
+                                                      gboolean advanced_in_case);
+
 struct _FpDeviceCs9711
 {
   FpImageDevice parent;

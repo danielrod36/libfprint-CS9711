@@ -32,9 +32,11 @@ jobs:
 
           # Newest review carrying a verdict, restricted to the head commit.
           # A stale review of an older head must never decide this run.
-          body="$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" \
+          # --slurp: --paginate runs jq once per page, so a bare `last` would
+          # pick the last review of the LAST PAGE, not of the PR.
+          body="$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews" \
             --jq --arg sha "$HEAD_SHA" '
-              [ .[]
+              [ .[][]
                 | select(.commit_id == $sha)
                 | select(.body | test("Verdict"))
               ]

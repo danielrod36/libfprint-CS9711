@@ -629,6 +629,34 @@ fp_print_equal (FpPrint *self, FpPrint *other)
 
       return TRUE;
 
+    case FPI_PRINT_SIGFM:
+      /* SIGFM prints are a list of serialized SigfmImgInfo blobs. The
+       * serialized form is what gets stored and compared on the wire, so two
+       * prints are equal iff their blob lists match. Without this case the
+       * switch fell through to g_assert_not_reached(): the image-device verify
+       * path calls fp_print_equal() against the gallery for every SIGFM print,
+       * so the daemon died with SIGILL instead of reporting verify-no-match. */
+      if (self->prints->len != other->prints->len)
+        return FALSE;
+
+      for (guint i = 0; i < self->prints->len; i++)
+        {
+          g_autofree unsigned char *a = NULL;
+          g_autofree unsigned char *b = NULL;
+          int a_len = 0;
+          int b_len = 0;
+          SigfmImgInfo *a_info = g_ptr_array_index (self->prints, i);
+          SigfmImgInfo *b_info = g_ptr_array_index (other->prints, i);
+
+          a = sigfm_serialize_binary (a_info, &a_len);
+          b = sigfm_serialize_binary (b_info, &b_len);
+
+          if (a_len != b_len || memcmp (a, b, a_len) != 0)
+            return FALSE;
+        }
+
+      return TRUE;
+
     case FPI_PRINT_UNDEFINED:
       g_assert_not_reached ();
     }

@@ -32,16 +32,17 @@ jobs:
 
           # Newest review carrying a verdict, restricted to the head commit.
           # A stale review of an older head must never decide this run.
-          # --slurp: --paginate runs jq once per page, so a bare `last` would
-          # pick the last review of the LAST PAGE, not of the PR.
+          # gh runs --jq once per page, so a bare `last` would pick the last
+          # review of the LAST PAGE, not of the PR. --slurp cannot be combined
+          # with --jq, so pages are slurped and filtered with jq itself.
           body="$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews" \
-            --jq --arg sha "$HEAD_SHA" '
-              [ .[][]
-                | select(.commit_id == $sha)
-                | select(.body | test("Verdict"))
-              ]
-              | if length == 0 then "" else (last | .body) end
-            ')"
+            | jq -r --arg sha "$HEAD_SHA" '
+                [ .[][]
+                  | select(.commit_id == $sha)
+                  | select(.body | test("Verdict"))
+                ]
+                | if length == 0 then "" else (last | .body) end
+              ')"
 
           if [ -z "$body" ]; then
             echo "result=pending" >> "$GITHUB_OUTPUT"

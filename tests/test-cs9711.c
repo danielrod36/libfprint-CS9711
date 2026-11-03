@@ -86,11 +86,13 @@ test_init_transitions (void)
   g_assert_cmpint (cs9711_init_next_state (CS9711_INIT_STATE_RECOVER_SEND_RESET), ==,
                    CS9711_INIT_STATE_RECOVER_READ_IGNORED_RESET);
 
-  /* F1: the resync path advances one state at a time, in order, and reaches
-   * RECEIVE_STATUS exactly once. The former defect stepped twice out of
-   * RESYNC_SEND_INIT; walking the table makes a double step visible, because
-   * RECEIVE_STATUS must be reachable from RESYNC_SEND_INIT in one hop and
-   * must not itself advance synchronously. */
+  /* F1: the resync path advances one state at a time and reaches
+   * RECEIVE_STATUS exactly once, then stops. What this pins is the graph:
+   * RECEIVE_STATUS has no synchronous successor and the chain from the mismatch
+   * jump target is exactly four hops. The double advance that caused the
+   * blocker was an extra statement in a case body, which no table assertion can
+   * see; m_init_state() now advances only from its epilogue, so there is no
+   * per-case advance for that defect to reappear in. */
   g_assert_cmpint (cs9711_init_next_state (CS9711_INIT_STATE_RESYNC_DRAIN), ==,
                    CS9711_INIT_STATE_RESYNC_SEND_RESET);
   g_assert_cmpint (cs9711_init_next_state (CS9711_INIT_STATE_RESYNC_SETTLE), ==,

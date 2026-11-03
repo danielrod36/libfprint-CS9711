@@ -42,9 +42,35 @@ typedef enum
   CS9711_DEACTIVATE_WAIT_FOR_SCAN,
 } Cs9711DeactivateAction;
 
+typedef enum
+{
+  CS9711_INIT_MISMATCH_RESYNC,
+  CS9711_INIT_MISMATCH_FAIL,
+} Cs9711InitMismatchAction;
+
+/* Init state machine states. Exposed so the ordering that the resync logic
+ * depends on (recovery states before the status read, status read last) is
+ * assertable in tests rather than only in comments. */
+typedef enum
+{
+  CS9711_INIT_STATE_SEND_INI_QUERY = 0,
+  CS9711_INIT_STATE_RECOVER_READ_IGNORED,
+  CS9711_INIT_STATE_RECOVER_SEND_RESET,
+  CS9711_INIT_STATE_RECOVER_READ_IGNORED_RESET,
+  CS9711_INIT_STATE_RECOVER_SEND_INIT,
+  CS9711_INIT_STATE_RESYNC_DRAIN,
+  CS9711_INIT_STATE_RESYNC_SEND_RESET,
+  CS9711_INIT_STATE_RESYNC_SETTLE,
+  CS9711_INIT_STATE_RESYNC_SEND_INIT,
+  CS9711_INIT_STATE_RECEIVE_STATUS,
+  CS9711_INIT_STATE_COUNT,
+} Cs9711InitState;
+
 Cs9711ScanErrorAction    cs9711_scan_error_action    (const GError *error,
                                                       gboolean      action_cancelled);
 Cs9711DeactivateAction   cs9711_deactivate_action    (gboolean scan_running);
+Cs9711InitMismatchAction cs9711_init_mismatch_action (guint         resyncs,
+                                                      guint         max_resyncs);
 
 struct _FpDeviceCs9711
 {

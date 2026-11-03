@@ -1,0 +1,77 @@
+name: review-gate
+
+# The review lane posts as drc-review-bot[bot] with review state COMMENTED,
+# which GitHub cannot turn into a blocking review. This job converts the
+# verdict text into a check-run, so "request changes" fails the build and the
+# PR cannot merge. The check must run on pull_request for forks too, hence the
+# explicit head sha: the verdict is about the head, never the merge commit.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+jobs:
+  review-gate:
+    name: Review Verdict
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read the newest review on the head commit
+        id: verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Newest review carrying a verdict, restricted to the head commit.
+          # A stale review of an older head must never decide this run.
+          body="$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" \
+            --jq --arg sha "$HEAD_SHA" '
+              [ .[]
+                | select(.commit_id == $sha)
+                | select(.body | test("Verdict"))
+              ]
+              | if length == 0 then "" else (last | .body) end
+            ')"
+
+          if [ -z "$body" ]; then
+            echo "result=pending" >> "$GITHUB_OUTPUT"
+            echo "::error::No review verdict found on $HEAD_SHA. The review lane must review the current head before this PR can merge."
+            exit 1
+          fi
+
+          verdict="$(printf '%s\n' "$body" | sed -n 's/.*\*\*Verdict:\*\*[[:space:]]*\([^·]*\)·.*/\1/p' | head -1 | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+          score="$(printf '%s\n' "$body" | sed -n 's/.*\*\*Score:\*\*[[:space:]]*\([0-9]*\)\/.*/\1/p' | head -1)"
+
+          # Findings table: count anything above "nit" in a tier row.
+          blocker="$(printf '%s\n' "$body" | sed -n 's/^| *blocker *| *\([0-9]*\) *|.*/\1/p' | head -1)"
+          major="$(printf '%s\n' "$body" | sed -n 's/^| *major *| *\([0-9]*\) *|.*/\1/p' | head -1)"
+          minor="$(printf '%s\n' "$body" | sed -n 's/^| *minor *| *\([0-9]*\) *|.*/\1/p' | head -1)"
+          nit="$(printf '%s\n' "$body" | sed -n 's/^| *nit *| *\([0-9]*\) *|.*/\1/p' | head -1)"
+
+          blocker="${blocker:-0}"; major="${major:-0}"
+          minor="${minor:-0}";     nit="${nit:-0}"
+          total=$((blocker + major + minor + nit))
+
+          echo "verdict=$verdict score=$score findings=$total (b=$blocker mj=$major mn=$minor n=$nit)"
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+
+          # The gate: an explicit approval AND zero findings of any kind.
+          if [ "$verdict" = "approve" ] || [ "$verdict" = "approved" ]; then
+            if [ "$total" -eq 0 ]; then
+              echo "Gate passed: approved with zero findings."
+              exit 0
+            fi
+            echo "::error::Verdict is approve but $total finding(s) remain; the gate requires zero findings of any kind."
+            exit 1
+          fi
+
+          echo "::error::Review verdict on $HEAD_SHA is '$verdict' with $total finding(s). CHANGES REQUESTED must be addressed, never merged over."
+          exit 1

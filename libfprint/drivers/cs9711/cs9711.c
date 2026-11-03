@@ -31,7 +31,15 @@ G_DEFINE_TYPE (FpDeviceCs9711, fpi_device_cs9711, FP_TYPE_IMAGE_DEVICE)
 #define CS9711_SENSOR_HEIGHT 236
 
 #define CS9711_DEFAULT_WAIT_TIMEOUT 300
-#define CS9711_DEFAULT_RESET_SLEEP  250
+#define CS9711_DEFAULT_RESET_SLEEP  1500
+
+/* A reply we did not ask for means frames are still queued in the reader (a
+ * scan or init that timed out leaves its reply behind). Draining and starting
+ * over recovers the device; how many times we allow that before declaring it
+ * dead. */
+#define CS9711_INIT_MAX_RESYNCS   2
+#define CS9711_DRAIN_MAX_ROUNDS   4
+#define CS9711_DRAIN_TIMEOUT       150
 
 #define CS9711_SEND_ENDPOINT    0x01
 #define CS9711_RECEIVE_ENDPOINT 0x81
@@ -134,6 +142,55 @@ usb_read_in (FpDevice *dev,
 
 /************************** INIT SSM *************************************/
 
+/* Discard frames left queued by an earlier operation that timed out (a scan
+ * whose reply nobody read, or an aborted init). Without this the next reply we
+ * read belongs to something else, which is how a verify ends up parsing an
+ * 8000-byte image frame as an 8-byte status reply. */
+static void
+usb_drain_sync (FpDevice *dev)
+{
+  guint drained = 0;
+
+  for (guint i = 0; i < CS9711_DRAIN_MAX_ROUNDS; i++)
+    {
+      FpiUsbTransfer *transfer;
+      GError *error = NULL;
+
+      transfer = fpi_usb_transfer_new (dev);
+      transfer->short_is_error = FALSE;
+      fpi_usb_transfer_fill_bulk (transfer, CS9711_RECEIVE_ENDPOINT,
+                                  CS9711_FP_RECV_LEN_MAX);
+      fpi_usb_transfer_submit_sync (transfer, CS9711_DRAIN_TIMEOUT, &error);
+      if (error)
+        {
+          /* Nothing (more) queued: the timeout is the expected outcome. */
+          g_error_free (error);
+          break;
+        }
+      drained++;
+    }
+
+  if (drained)
+    fp_dbg ("Drained %u stale frame(s) before init", drained);
+}
+
+enum {
+  M_INIT_STATE_SEND_INI_QUERY = 0,
+  M_INIT_STATE_RECOVER_READ_IGNORED,
+  M_INIT_STATE_RECOVER_SEND_RESET,
+  M_INIT_STATE_RECOVER_READ_IGNORED_RESET,
+  M_INIT_STATE_RECOVER_SEND_INIT,
+  /* Recovery states come before M_INIT_STATE_RECEIVE_STATUS on purpose: this
+   * state machine runs its states in order, so whatever sits after the status
+   * read would run on the success path too. The status read must be last. */
+  M_INIT_STATE_RESYNC_DRAIN,
+  M_INIT_STATE_RESYNC_SEND_RESET,
+  M_INIT_STATE_RESYNC_SETTLE,
+  M_INIT_STATE_RESYNC_SEND_INIT,
+  M_INIT_STATE_RECEIVE_STATUS,
+  M_INIT_STATE_COUNT,
+};
+
 static void
 m_init_read_cb_check_expected (FpiUsbTransfer *transfer,
                                FpDevice       *dev,
@@ -162,10 +219,31 @@ m_init_read_cb_check_expected (FpiUsbTransfer *transfer,
           fpi_ssm_mark_failed (transfer->ssm, error);
         }
       else if (memcmp (transfer->buffer, expected, CS9711_FP_CMD_LEN_1)) {
-        if (!user_data_is_ignore_mismatch_if_non_null) {
-          fp_warn ("Error; got different state response than expected, but don't understand it anyway, continuing");
-        }
-        fpi_ssm_next_state(transfer->ssm);
+        /* The reply is not the one we asked for. The original code stepped the
+         * state machine forward anyway, which fed a mismatched buffer into the
+         * rest of init and into libfprint's timeout/cancel path -- that is the
+         * SIGSEGV users hit during unlock. Treat it for what it is: the device
+         * and host are out of sync, so clear the queue and start init over. */
+        FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
+
+        fp_warn ("Init reply mismatch (%" G_GSSIZE_FORMAT " bytes, first %02x); resync %u/%u",
+                 transfer->actual_length, transfer->buffer[0],
+                 self->init_resyncs + 1, CS9711_INIT_MAX_RESYNCS);
+
+        if (self->init_resyncs < CS9711_INIT_MAX_RESYNCS)
+          {
+            /* Step 1 of recovery: drop whatever else is queued, then reset. */
+            self->init_resyncs++;
+            user_data_is_ignore_mismatch_if_non_null = NULL;
+            fpi_ssm_jump_to_state (transfer->ssm, M_INIT_STATE_RESYNC_DRAIN);
+          }
+        else
+          {
+            error = g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                                 "Init: device out of sync after %u resyncs",
+                                 CS9711_INIT_MAX_RESYNCS);
+            fpi_ssm_mark_failed (transfer->ssm, error);
+          }
       }
       else
         {
@@ -174,16 +252,6 @@ m_init_read_cb_check_expected (FpiUsbTransfer *transfer,
         }
     }
 }
-
-enum {
-  M_INIT_STATE_SEND_INI_QUERY = 0,
-  M_INIT_STATE_RECOVER_READ_IGNORED,
-  M_INIT_STATE_RECOVER_SEND_RESET,
-  M_INIT_STATE_RECOVER_READ_IGNORED_RESET,
-  M_INIT_STATE_RECOVER_SEND_INIT,
-  M_INIT_STATE_RECEIVE_STATUS,
-  M_INIT_STATE_COUNT,
-};
 
 /* Exec init sequential state machine */
 static void
@@ -231,6 +299,30 @@ m_init_state (FpiSsm *ssm, FpDevice *_dev)
 
     case M_INIT_STATE_RECEIVE_STATUS:
       usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, TRUE, CS9711_DEFAULT_WAIT_TIMEOUT, m_init_read_cb_check_expected, NULL);
+      break;
+
+    case M_INIT_STATE_RESYNC_DRAIN:
+      usb_drain_sync (_dev);
+      fpi_ssm_next_state (ssm);
+      break;
+
+    case M_INIT_STATE_RESYNC_SEND_RESET:
+      usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_RESET, &error);
+      m_util_fail_if_error_or_next (ssm, error);
+      break;
+
+    case M_INIT_STATE_RESYNC_SETTLE:
+      /* Give the reader time to act on the reset before we talk again. */
+      fpi_ssm_next_state_delayed (ssm, CS9711_DEFAULT_RESET_SLEEP);
+      break;
+
+    case M_INIT_STATE_RESYNC_SEND_INIT:
+      usb_drain_sync (_dev);
+      usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_INIT, &error);
+      m_util_fail_if_error_or_next (ssm, error);
+      /* RECEIVE_STATUS is the last state, so this advances to it and the
+       * machine completes there instead of running off the end. */
+      fpi_ssm_next_state (ssm);
       break;
 
     default:
@@ -451,7 +543,13 @@ m_scan_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
 static void
 dev_activate (FpImageDevice *dev)
 {
+  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (dev);
   FpiSsm *ssm;
+
+  /* Every activation starts clean: no leftover frames from a previous
+   * operation, and a fresh resync budget. */
+  self->init_resyncs = 0;
+  usb_drain_sync (FP_DEVICE (dev));
 
   /* Start init ssm */
   ssm = fpi_ssm_new (FP_DEVICE (dev), m_init_state, M_INIT_STATE_COUNT);

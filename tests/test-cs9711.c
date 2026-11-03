@@ -73,6 +73,54 @@ test_init_state_order (void)
   g_assert_cmpint (CS9711_INIT_STATE_SEND_INI_QUERY, ==, 0);
 }
 
+/* The transitions the two review rounds actually fixed. Reading them from
+ * cs9711_init_next_state() means the assertions break if either successor is
+ * reverted, which the layout assertions above could not detect. */
+static void
+test_init_transitions (void)
+{
+  /* F2: recovery keeps its pre-resync successor. RESYNC_DRAIN here would
+   * drain and reset a device that just accepted the re-sent init query. */
+  g_assert_cmpint (cs9711_init_next_state (CS9711_INIT_STATE_RECOVER_SEND_INIT), ==,
+                   CS9711_INIT_STATE_RECEIVE_STATUS);
+  g_assert_cmpint (cs9711_init_next_state (CS9711_INIT_STATE_RECOVER_SEND_RESET), ==,
+                   CS9711_INIT_STATE_RECOVER_READ_IGNORED_RESET);
+
+  /* F1: the resync path advances one state at a time, in order, and reaches
+   * RECEIVE_STATUS exactly once. The former defect stepped twice out of
+   * RESYNC_SEND_INIT; walking the table makes a double step visible, because
+   * RECEIVE_STATUS must be reachable from RESYNC_SEND_INIT in one hop and
+   * must not itself advance synchronously. */
+  g_assert_cmpint (cs9711_init_next_state (CS9711_INIT_STATE_RESYNC_DRAIN), ==,
+                   CS9711_INIT_STATE_RESYNC_SEND_RESET);
+  g_assert_cmpint (cs9711_init_next_state (CS9711_INIT_STATE_RESYNC_SETTLE), ==,
+                   CS9711_INIT_STATE_RESYNC_SEND_INIT);
+  g_assert_cmpint (cs9711_init_next_state (CS9711_INIT_STATE_RESYNC_SEND_INIT), ==,
+                   CS9711_INIT_STATE_RECEIVE_STATUS);
+  g_assert_cmpint (cs9711_init_next_state (CS9711_INIT_STATE_RECEIVE_STATUS), ==,
+                   CS9711_INIT_STATE_COUNT);
+
+  /* A state that defers to a read callback must not claim a synchronous
+   * successor, and must never read as "complete". */
+  g_assert_cmpint (cs9711_init_next_state (CS9711_INIT_STATE_RECOVER_READ_IGNORED), ==,
+                   CS9711_INIT_STATE_COUNT);
+  g_assert_cmpint (cs9711_init_next_state (CS9711_INIT_STATE_RECOVER_READ_IGNORED_RESET), ==,
+                   CS9711_INIT_STATE_COUNT);
+
+  /* The whole resync chain from the mismatch jump target is terminal at
+   * RECEIVE_STATUS: no successor of any resync state can skip past it. */
+  Cs9711InitState s = CS9711_INIT_STATE_RESYNC_DRAIN;
+  guint hops = 0;
+  while (s != CS9711_INIT_STATE_COUNT && s != CS9711_INIT_STATE_RECEIVE_STATUS)
+    {
+      s = cs9711_init_next_state (s);
+      hops++;
+      g_assert_cmpuint (hops, <=, CS9711_INIT_STATE_COUNT);
+    }
+  g_assert_cmpint (s, ==, CS9711_INIT_STATE_RECEIVE_STATUS);
+  g_assert_cmpuint (hops, ==, 4); /* DRAIN, SEND_RESET, SETTLE, SEND_INIT */
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -81,6 +129,7 @@ main (int argc, char *argv[])
   g_test_add_func ("/cs9711/deactivate-action", test_deactivate_action);
   g_test_add_func ("/cs9711/init-mismatch-action", test_init_mismatch_action);
   g_test_add_func ("/cs9711/init-state-order", test_init_state_order);
+  g_test_add_func ("/cs9711/init-transitions", test_init_transitions);
 
   return g_test_run ();
 }

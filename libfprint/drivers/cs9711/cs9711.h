@@ -72,6 +72,13 @@ Cs9711DeactivateAction   cs9711_deactivate_action    (gboolean scan_running);
 Cs9711InitMismatchAction cs9711_init_mismatch_action (guint         resyncs,
                                                       guint         max_resyncs);
 
+/* Successor of a synchronous init state. The init case bodies advance by
+ * exactly one call to this, so the transition graph is data that tests can
+ * assert instead of statements buried in a switch. Returns
+ * CS9711_INIT_STATE_COUNT for a state that does not advance synchronously
+ * (it defers to an async read callback). */
+Cs9711InitState          cs9711_init_next_state     (Cs9711InitState state);
+
 struct _FpDeviceCs9711
 {
   FpImageDevice parent;

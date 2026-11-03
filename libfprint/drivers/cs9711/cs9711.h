@@ -55,6 +55,7 @@ struct _FpDeviceCs9711
   gboolean      scan_started;
   gboolean      image_ready;
   gboolean      deactivating;
+  guint         init_resyncs;
 };
 
 G_DECLARE_FINAL_TYPE (FpDeviceCs9711, fpi_device_cs9711, FPI, DEVICE_CS9711, FpImageDevice)

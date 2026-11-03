@@ -2169,8 +2169,13 @@ fpi_device_verify_report (FpDevice      *device,
           fpi_device_get_verify_data (device, &data->match);
           g_object_ref (data->match);
 
+          /* SIGFM is excluded for the same reason as NBIS: a freshly scanned
+           * print is never equal to the enrolled template it matched, so an
+           * equality check here is meaningless and only produced a spurious
+           * warning on every successful verify. */
           if (print &&
               fpi_print_get_type (print) != FPI_PRINT_NBIS &&
+              fpi_print_get_type (print) != FPI_PRINT_SIGFM &&
               !fp_print_equal (print, data->match))
             {
               g_warning ("Driver reported a match providing a scanned print that is not matching it.");
@@ -2271,6 +2276,7 @@ fpi_device_identify_report (FpDevice *device,
   else
     {
       if (match && print && fpi_print_get_type (print) != FPI_PRINT_NBIS &&
+          fpi_print_get_type (print) != FPI_PRINT_SIGFM &&
           !g_ptr_array_find_with_equal_func (data->gallery, print,
                                              (GEqualFunc) fp_print_equal, NULL))
         {

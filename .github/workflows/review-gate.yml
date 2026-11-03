@@ -1,0 +1,98 @@
+name: review-gate
+
+# The review lane posts as drc-review-bot[bot] with review state COMMENTED,
+# which GitHub cannot turn into a blocking review. This job converts the
+# verdict text into a check-run, so "request changes" fails the build and the
+# PR cannot merge.
+#
+# Two triggers on purpose:
+#   pull_request         - a new head invalidates the previous verdict.
+#   pull_request_review  - the verdict itself arrives as a review, which emits
+#                          no pull_request event. Without this the required
+#                          check stays red after the lane finishes and every
+#                          merge needs a no-op push to re-run it.
+#
+# The verdict is about the head sha, never the merge commit.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+jobs:
+  review-gate:
+    name: Review Verdict
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate the newest verdict on the head commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # The one identity whose verdict this gate trusts. Any other user can
+          # submit a COMMENTED review, so trusting mere presence of the word
+          # "Verdict" let the PR author approve their own head.
+          TRUSTED_REVIEWER: drc-review-bot[bot]
+        run: |
+          set -euo pipefail
+
+          # gh runs --jq once per page, so a bare `last` would pick the last
+          # review of the LAST PAGE, not of the PR. --slurp cannot be combined
+          # with --jq, so pages are slurped and filtered with jq itself.
+          body="$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews" \
+            | jq -r --arg sha "$HEAD_SHA" --arg who "$TRUSTED_REVIEWER" '
+                [ .[][]
+                  | select(.commit_id == $sha)
+                  | select(.user.login == $who)
+                  | select(.body | test("Verdict"))
+                ]
+                | if length == 0 then "" else (last | .body) end
+              ')"
+
+          if [ -z "$body" ]; then
+            echo "::error::No verdict from $TRUSTED_REVIEWER found on $HEAD_SHA. The review lane must review the current head before this PR can merge. Reviews by any other account are ignored."
+            exit 1
+          fi
+
+          verdict="$(printf '%s\n' "$body" | sed -n 's/.*\*\*Verdict:\*\*[[:space:]]*\([^·]*\)·.*/\1/p' | head -1 | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+          score="$(printf '%s\n' "$body" | sed -n 's/.*\*\*Score:\*\*[[:space:]]*\([0-9]*\)\/.*/\1/p' | head -1)"
+
+          if [ -z "$verdict" ]; then
+            echo "::error::Review on $HEAD_SHA carries no parseable **Verdict:** line; the gate cannot assume a pass."
+            exit 1
+          fi
+
+          # Findings table. Every tier row must be present and numeric: a body
+          # with no table previously defaulted every count to 0, which turned
+          # an unparseable review into a clean approval.
+          for tier in blocker major minor nit; do
+            value="$(printf '%s\n' "$body" | sed -n "s/^| *$tier *| *\([0-9][0-9]*\) *|.*/\1/p" | head -1)"
+            if [ -z "$value" ]; then
+              echo "::error::Review on $HEAD_SHA has no numeric '$tier' row in its findings table; refusing to infer zero findings."
+              exit 1
+            fi
+            eval "$tier=\$value"
+          done
+
+          total=$((blocker + major + minor + nit))
+          echo "verdict=$verdict score=$score findings=$total (b=$blocker mj=$major mn=$minor n=$nit)"
+
+          # The gate: an explicit approval AND zero findings of any kind.
+          if [ "$verdict" = "approve" ] || [ "$verdict" = "approved" ]; then
+            if [ "$total" -eq 0 ]; then
+              echo "Gate passed: $TRUSTED_REVIEWER approved $HEAD_SHA with zero findings."
+              exit 0
+            fi
+            echo "::error::Verdict is approve but $total finding(s) remain; the gate requires zero findings of any kind."
+            exit 1
+          fi
+
+          echo "::error::Review verdict on $HEAD_SHA is '$verdict' with $total finding(s). CHANGES REQUESTED must be addressed, never merged over."
+          exit 1

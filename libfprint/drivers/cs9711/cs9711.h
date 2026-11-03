@@ -42,9 +42,55 @@ typedef enum
   CS9711_DEACTIVATE_WAIT_FOR_SCAN,
 } Cs9711DeactivateAction;
 
+typedef enum
+{
+  CS9711_INIT_MISMATCH_RESYNC,
+  CS9711_INIT_MISMATCH_FAIL,
+} Cs9711InitMismatchAction;
+
+/* Init state machine states. Exposed so the ordering that the resync logic
+ * depends on (recovery states before the status read, status read last) is
+ * assertable in tests rather than only in comments. */
+typedef enum
+{
+  CS9711_INIT_STATE_SEND_INI_QUERY = 0,
+  CS9711_INIT_STATE_RECOVER_READ_IGNORED,
+  CS9711_INIT_STATE_RECOVER_SEND_RESET,
+  CS9711_INIT_STATE_RECOVER_READ_IGNORED_RESET,
+  CS9711_INIT_STATE_RECOVER_SEND_INIT,
+  CS9711_INIT_STATE_RESYNC_DRAIN,
+  CS9711_INIT_STATE_RESYNC_SEND_RESET,
+  CS9711_INIT_STATE_RESYNC_SETTLE,
+  CS9711_INIT_STATE_RESYNC_SEND_INIT,
+  CS9711_INIT_STATE_RECEIVE_STATUS,
+  CS9711_INIT_STATE_COUNT,
+} Cs9711InitState;
+
 Cs9711ScanErrorAction    cs9711_scan_error_action    (const GError *error,
                                                       gboolean      action_cancelled);
 Cs9711DeactivateAction   cs9711_deactivate_action    (gboolean scan_running);
+Cs9711InitMismatchAction cs9711_init_mismatch_action (guint         resyncs,
+                                                      guint         max_resyncs);
+
+/* Successor of a synchronous init state. The init case bodies advance by
+ * exactly one call to this, so the transition graph is data that tests can
+ * assert instead of statements buried in a switch. Returns
+ * CS9711_INIT_STATE_COUNT for a state that does not advance synchronously
+ * (it defers to an async read callback). */
+Cs9711InitState          cs9711_init_next_state     (Cs9711InitState state);
+
+gboolean                 cs9711_init_error_is_recoverable (const GError *error);
+
+typedef enum
+{
+  CS9711_INIT_EPILOGUE_ADVANCE, /* advance exactly one state */
+  CS9711_INIT_EPILOGUE_FAIL,    /* fail the machine with the error */
+  CS9711_INIT_EPILOGUE_STAY,    /* a state or callback owns the next step */
+} Cs9711InitEpilogue;
+
+Cs9711InitEpilogue       cs9711_init_epilogue       (gboolean has_error,
+                                                      gboolean advanced_by_callback,
+                                                      gboolean advanced_in_case);
 
 struct _FpDeviceCs9711
 {

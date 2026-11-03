@@ -31,7 +31,11 @@ G_DEFINE_TYPE (FpDeviceCs9711, fpi_device_cs9711, FP_TYPE_IMAGE_DEVICE)
 #define CS9711_SENSOR_HEIGHT 236
 
 #define CS9711_DEFAULT_WAIT_TIMEOUT 300
+/* Settle time after a reset command. Only the reset paths take this; the scan
+ * path keeps the shorter delay so every capture does not pay the extra 1.25 s
+ * that a reset needs. */
 #define CS9711_DEFAULT_RESET_SLEEP  1500
+#define CS9711_DEFAULT_SCAN_SLEEP    250
 
 /* A reply we did not ask for means frames are still queued in the reader (a
  * scan or init that timed out leaves its reply behind). Draining and starting
@@ -70,6 +74,89 @@ cs9711_deactivate_action (gboolean scan_running)
 {
   return scan_running ? CS9711_DEACTIVATE_WAIT_FOR_SCAN :
                         CS9711_DEACTIVATE_COMPLETE;
+}
+
+Cs9711InitMismatchAction
+cs9711_init_mismatch_action (guint resyncs, guint max_resyncs)
+{
+  return resyncs < max_resyncs ? CS9711_INIT_MISMATCH_RESYNC :
+                                 CS9711_INIT_MISMATCH_FAIL;
+}
+
+gboolean
+cs9711_init_error_is_recoverable (const GError *error)
+{
+  /* A timeout on the first init query is expected: the reader answers late.
+   * RECOVER_READ_IGNORED picks the answer up, so the error must be cleared
+   * before advancing -- otherwise the epilogue fails a machine whose follow-up
+   * read is in flight. */
+  return error != NULL &&
+         error->domain == G_USB_DEVICE_ERROR &&
+         error->code == G_USB_DEVICE_ERROR_TIMED_OUT;
+}
+
+Cs9711InitEpilogue
+cs9711_init_epilogue (gboolean has_error, gboolean advanced_by_callback,
+                      gboolean advanced_in_case)
+{
+  /* A state that already advanced owns the machine's fate: failing it here
+   * would free the machine while the read that state just submitted is still
+   * in flight (round-3 blocker). */
+  if (advanced_by_callback || advanced_in_case)
+    {
+      /* An error alongside a callback-driven state is expected: the read that
+       * state submitted reports through its own callback. Only a case body that
+       * advanced AND left an error set is a bug, because the machine is then
+       * live while its follow-up read is in flight. */
+      if (has_error && advanced_in_case && !advanced_by_callback)
+        g_warning ("cs9711: error after the init SM advanced; ignoring it to "
+                   "avoid freeing a machine with a read in flight");
+
+      return CS9711_INIT_EPILOGUE_STAY;
+    }
+
+  return has_error ? CS9711_INIT_EPILOGUE_FAIL : CS9711_INIT_EPILOGUE_ADVANCE;
+}
+
+Cs9711InitState
+cs9711_init_next_state (Cs9711InitState state)
+{
+  switch (state)
+    {
+    case CS9711_INIT_STATE_SEND_INI_QUERY:
+      return CS9711_INIT_STATE_RECEIVE_STATUS;
+
+    case CS9711_INIT_STATE_RECOVER_SEND_RESET:
+      return CS9711_INIT_STATE_RECOVER_READ_IGNORED_RESET;
+
+    case CS9711_INIT_STATE_RECOVER_SEND_INIT:
+      /* Recovery keeps its pre-resync successor: the device just accepted a
+       * re-sent init query, so draining and resetting it again would be wrong. */
+      return CS9711_INIT_STATE_RECEIVE_STATUS;
+
+    case CS9711_INIT_STATE_RESYNC_DRAIN:
+      return CS9711_INIT_STATE_RESYNC_SEND_RESET;
+
+    case CS9711_INIT_STATE_RESYNC_SEND_RESET:
+      return CS9711_INIT_STATE_RESYNC_SETTLE;
+
+    case CS9711_INIT_STATE_RESYNC_SETTLE:
+      return CS9711_INIT_STATE_RESYNC_SEND_INIT;
+
+    case CS9711_INIT_STATE_RESYNC_SEND_INIT:
+      return CS9711_INIT_STATE_RECEIVE_STATUS;
+
+    case CS9711_INIT_STATE_RECOVER_READ_IGNORED:
+    case CS9711_INIT_STATE_RECOVER_READ_IGNORED_RESET:
+    case CS9711_INIT_STATE_RECEIVE_STATUS:
+      /* Advanced from a USB read callback, not synchronously. */
+      return CS9711_INIT_STATE_COUNT;
+
+    case CS9711_INIT_STATE_COUNT:
+      break;
+    }
+
+  g_assert_not_reached ();
 }
 
 
@@ -153,7 +240,7 @@ usb_drain_sync (FpDevice *dev)
 
   for (guint i = 0; i < CS9711_DRAIN_MAX_ROUNDS; i++)
     {
-      FpiUsbTransfer *transfer;
+      g_autoptr(FpiUsbTransfer) transfer = NULL;
       GError *error = NULL;
 
       transfer = fpi_usb_transfer_new (dev);
@@ -174,27 +261,25 @@ usb_drain_sync (FpDevice *dev)
     fp_dbg ("Drained %u stale frame(s) before init", drained);
 }
 
-enum {
-  M_INIT_STATE_SEND_INI_QUERY = 0,
-  M_INIT_STATE_RECOVER_READ_IGNORED,
-  M_INIT_STATE_RECOVER_SEND_RESET,
-  M_INIT_STATE_RECOVER_READ_IGNORED_RESET,
-  M_INIT_STATE_RECOVER_SEND_INIT,
-  /* Recovery states come before M_INIT_STATE_RECEIVE_STATUS on purpose: this
-   * state machine runs its states in order, so whatever sits after the status
-   * read would run on the success path too. The status read must be last. */
-  M_INIT_STATE_RESYNC_DRAIN,
-  M_INIT_STATE_RESYNC_SEND_RESET,
-  M_INIT_STATE_RESYNC_SETTLE,
-  M_INIT_STATE_RESYNC_SEND_INIT,
-  M_INIT_STATE_RECEIVE_STATUS,
-  M_INIT_STATE_COUNT,
-};
+/* The init state list lives in cs9711.h so tests can assert the ordering the
+ * resync logic depends on. These aliases keep the call sites reading as
+ * M_INIT_STATE_*. */
+#define M_INIT_STATE_SEND_INI_QUERY             CS9711_INIT_STATE_SEND_INI_QUERY
+#define M_INIT_STATE_RECOVER_READ_IGNORED       CS9711_INIT_STATE_RECOVER_READ_IGNORED
+#define M_INIT_STATE_RECOVER_SEND_RESET         CS9711_INIT_STATE_RECOVER_SEND_RESET
+#define M_INIT_STATE_RECOVER_READ_IGNORED_RESET CS9711_INIT_STATE_RECOVER_READ_IGNORED_RESET
+#define M_INIT_STATE_RECOVER_SEND_INIT          CS9711_INIT_STATE_RECOVER_SEND_INIT
+#define M_INIT_STATE_RESYNC_DRAIN               CS9711_INIT_STATE_RESYNC_DRAIN
+#define M_INIT_STATE_RESYNC_SEND_RESET          CS9711_INIT_STATE_RESYNC_SEND_RESET
+#define M_INIT_STATE_RESYNC_SETTLE              CS9711_INIT_STATE_RESYNC_SETTLE
+#define M_INIT_STATE_RESYNC_SEND_INIT           CS9711_INIT_STATE_RESYNC_SEND_INIT
+#define M_INIT_STATE_RECEIVE_STATUS             CS9711_INIT_STATE_RECEIVE_STATUS
+#define M_INIT_STATE_COUNT                      CS9711_INIT_STATE_COUNT
 
 static void
 m_init_read_cb_check_expected (FpiUsbTransfer *transfer,
                                FpDevice       *dev,
-                               gpointer        user_data_is_ignore_mismatch_if_non_null,
+                               G_GNUC_UNUSED gpointer user_data,
                                GError         *error)
 {
   const guint8 expected[] = CS9711_FP_CMD_STATE_RESULT_EXPECTED;
@@ -230,11 +315,12 @@ m_init_read_cb_check_expected (FpiUsbTransfer *transfer,
                  transfer->actual_length, transfer->buffer[0],
                  self->init_resyncs + 1, CS9711_INIT_MAX_RESYNCS);
 
-        if (self->init_resyncs < CS9711_INIT_MAX_RESYNCS)
+        if (cs9711_init_mismatch_action (self->init_resyncs,
+                                         CS9711_INIT_MAX_RESYNCS) ==
+            CS9711_INIT_MISMATCH_RESYNC)
           {
             /* Step 1 of recovery: drop whatever else is queued, then reset. */
             self->init_resyncs++;
-            user_data_is_ignore_mismatch_if_non_null = NULL;
             fpi_ssm_jump_to_state (transfer->ssm, M_INIT_STATE_RESYNC_DRAIN);
           }
         else
@@ -257,80 +343,112 @@ m_init_read_cb_check_expected (FpiUsbTransfer *transfer,
 static void
 m_init_state (FpiSsm *ssm, FpDevice *_dev)
 {
-  FpDeviceCs9711 *self = FPI_DEVICE_CS9711 (_dev);
   GError *error = NULL;
+  Cs9711InitState state = fpi_ssm_get_cur_state (ssm);
+  /* States whose next transition is driven by a USB read callback. They submit
+   * the read and return; the epilogue below must not advance them. */
+  gboolean advanced_by_callback = FALSE;
+  /* Set when the state already chose its successor (it may differ from the
+   * table, e.g. the timeout path of SEND_INI_QUERY). */
+  gboolean advanced_in_case = FALSE;
 
-  switch (fpi_ssm_get_cur_state (ssm))
+  switch (state)
     {
     case M_INIT_STATE_SEND_INI_QUERY:
       usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_INIT, &error);
       if (error)
         {
           fp_dbg("Error details: '%s', quark: %u code: %d", error->message, error->domain, error->code);
-          // if (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
-          if (error->code == G_USB_DEVICE_ERROR_TIMED_OUT && error->domain == G_USB_DEVICE_ERROR)
-            fpi_ssm_next_state (ssm);
+          if (cs9711_init_error_is_recoverable (error))
+            {
+              /* Deliberate recovery: the timeout is expected and already
+               * handled by the state we advance into. Clear it, or the epilogue
+               * below would fail the machine after it has advanced -- freeing it
+               * while RECOVER_READ_IGNORED's bulk read is still in flight. */
+              g_clear_error (&error);
+              fpi_ssm_next_state (ssm);
+              advanced_in_case = TRUE;
+            }
           else
-            fpi_ssm_mark_failed (ssm, error);
+            {
+              fpi_ssm_mark_failed (ssm, error);
+              return;
+            }
         }
-      else
-        fpi_ssm_jump_to_state (ssm, M_INIT_STATE_RECEIVE_STATUS);
       break;
 
     case M_INIT_STATE_RECOVER_READ_IGNORED:
-      fp_warn("Send operation had a timeout. Switching to reset procedure. Ignore next message about the result not matching the expected data.");
+    case M_INIT_STATE_RECOVER_READ_IGNORED_RESET:
+      fp_warn("Send operation had a timeout. Switching to reset procedure.");
       usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, FALSE, CS9711_DEFAULT_WAIT_TIMEOUT, m_init_read_cb_check_expected, NULL);
+      advanced_by_callback = TRUE;
       break;
 
     case M_INIT_STATE_RECOVER_SEND_RESET:
       usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_RESET, &error);
-      m_util_fail_if_error_or_next (ssm, error);
-      break;
-
-    case M_INIT_STATE_RECOVER_READ_IGNORED_RESET:
-      fp_warn("Send operation had a timeout. Switching to reset procedure.");
-      usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, FALSE, CS9711_DEFAULT_WAIT_TIMEOUT, m_init_read_cb_check_expected, self);
       break;
 
     case M_INIT_STATE_RECOVER_SEND_INIT:
       usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_INIT, &error); // Do not reuse state to only try reset once
-      m_util_fail_if_error_or_next (ssm, error);
       break;
 
     case M_INIT_STATE_RECEIVE_STATUS:
       usb_read_in (_dev, ssm, CS9711_FP_CMD_LEN_1, TRUE, CS9711_DEFAULT_WAIT_TIMEOUT, m_init_read_cb_check_expected, NULL);
+      advanced_by_callback = TRUE;
       break;
 
     case M_INIT_STATE_RESYNC_DRAIN:
       usb_drain_sync (_dev);
-      fpi_ssm_next_state (ssm);
       break;
 
     case M_INIT_STATE_RESYNC_SEND_RESET:
       usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_RESET, &error);
-      m_util_fail_if_error_or_next (ssm, error);
       break;
 
     case M_INIT_STATE_RESYNC_SETTLE:
       /* Give the reader time to act on the reset before we talk again. */
-      fpi_ssm_next_state_delayed (ssm, CS9711_DEFAULT_RESET_SLEEP);
+      fpi_ssm_jump_to_state_delayed (ssm,
+                                     cs9711_init_next_state (state),
+                                     CS9711_DEFAULT_RESET_SLEEP);
+      advanced_in_case = TRUE;
       break;
 
     case M_INIT_STATE_RESYNC_SEND_INIT:
       usb_drain_sync (_dev);
       usb_send_out_sync (_dev, CS9711_FP_CMD_TYPE_INIT, &error);
-      m_util_fail_if_error_or_next (ssm, error);
-      /* RECEIVE_STATUS is the last state, so this advances to it and the
-       * machine completes there instead of running off the end. */
-      fpi_ssm_next_state (ssm);
+      break;
+
+    case M_INIT_STATE_COUNT:
       break;
 
     default:
       g_assert_not_reached ();
     }
-  // cs9711_proto_init (self);
 
-  // fpi_ssm_mark_completed (ssm);
+  /* The single place this machine advances. Every synchronous state falls
+   * through to here, so a case body cannot step the SSM itself: the former
+   * blocker was exactly that, a second advance out of RESYNC_SEND_INIT that
+   * ran past RECEIVE_STATUS and completed the machine while its bulk read was
+   * still in flight.
+   *
+   * Failing after a state already advanced is the same class of bug: the
+   * machine is freed while the follow-up read is in flight. cs9711_init_epilogue()
+   * encodes the rule once, and the init-timeout path clears its recovered error
+   * before advancing so this cannot trigger there. */
+  switch (cs9711_init_epilogue (error != NULL, advanced_by_callback,
+                                advanced_in_case))
+    {
+    case CS9711_INIT_EPILOGUE_FAIL:
+      fpi_ssm_mark_failed (ssm, error);
+      break;
+
+    case CS9711_INIT_EPILOGUE_ADVANCE:
+      fpi_ssm_jump_to_state (ssm, cs9711_init_next_state (state));
+      break;
+
+    case CS9711_INIT_EPILOGUE_STAY:
+      break;
+    }
 }
 
 /* Complete init sequential state machine */
@@ -454,7 +572,7 @@ m_scan_state (FpiSsm *ssm, FpDevice *_dev)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case M_SCAN_INIT_SLEEP:
-      fpi_ssm_next_state_delayed (ssm, CS9711_DEFAULT_RESET_SLEEP);
+      fpi_ssm_next_state_delayed (ssm, CS9711_DEFAULT_SCAN_SLEEP);
       break;
 
     case M_SCAN_INIT_READ:

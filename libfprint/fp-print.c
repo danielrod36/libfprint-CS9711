@@ -629,6 +629,17 @@ fp_print_equal (FpPrint *self, FpPrint *other)
 
       return TRUE;
 
+    case FPI_PRINT_SIGFM:
+      /* No caller compares SIGFM prints: a scanned print is never equal to the
+       * enrolled template it matched, so fpi-device.c excludes SIGFM (as it
+       * already excluded NBIS) from both the verify-result and gallery equality
+       * checks. Reaching here means a new caller assumed equality means
+       * something; return FALSE rather than assert, so a daemon never dies on
+       * it, but say so loudly. */
+      g_warning ("fp_print_equal() called on SIGFM prints; compare with "
+                 "fpi_print_sigfm_match() instead.");
+      return FALSE;
+
     case FPI_PRINT_UNDEFINED:
       g_assert_not_reached ();
     }
